@@ -3,16 +3,16 @@ from dotenv import load_dotenv
 import os
 import matplotlib.pyplot as plt
 
-# Load semua environment variable dari file .env
+# Load environment variable
 load_dotenv()
 
-# Definisikan kredensial dari environment
+# Ambil kredensial MySQL
 user_name = os.environ.get("MYSQL_USERNAME")
 password = os.environ.get("MYSQL_PASSWORD")
 database = os.environ.get("DB_NAME")
 
 try:
-    # Membuat koneksi ke MySQL server
+    # Koneksi ke MySQL
     conn = mysql.connector.connect(
         host="localhost",
         user=user_name,
@@ -20,18 +20,15 @@ try:
         database=database,
     )
 
-    # Apabila koneksi berhasil
     if conn.is_connected():
         print("Successfully connecting to MySQL database!")
-
-        # Membuat object cursor untuk eksekusi SQL
         cursor = conn.cursor()
 
-        # ==============================
-        #   FUNGSI-FUNGSI PROGRAM
-        # ==============================
+        # ======================================================
+        #                FUNGSI–FUNGSI PROGRAM
+        # ======================================================
 
-        # 1. Tampilkan harga kamar
+        # 1. Daftar harga kamar
         def harga_kamar(cursor):
             cursor.execute("SELECT * FROM harga h")
             results = cursor.fetchall()
@@ -45,35 +42,34 @@ try:
             cursor.execute("SELECT * FROM inap")
             results = cursor.fetchall()
 
-            def safe(val):
-                return val if val is not None else ""
+            def safe(v): return v if v is not None else ""
 
             print("\n=== Daftar Rawat Inap ===")
-            print("Nama                                        | NIK              | Tgl_Lahir     | Tgl_Masuk | Penjamin   | ID_Kelas | Tgl_Keluar")
+            print("Nama            | NIK            | Lahir     | Masuk      | Penjamin | Kls | Keluar")
             for row in results:
                 print(
-                    f"{safe(row[1]):<18}\t|\t"
-                    f"{safe(row[2]):<16}\t|\t"
-                    f"{safe(row[3]):<15}\t|\t"
-                    f"{safe(row[4]):<15}\t|\t"
-                    f"{safe(row[5]):<12}\t|\t"
-                    f"{safe(row[6]):<8}\t|\t"
-                    f"{safe(row[7]):<12}"
+                    f"{safe(row[1]):<15} | "
+                    f"{safe(row[2]):<14} | "
+                    f"{safe(row[3]):<10} | "
+                    f"{safe(row[4]):<10} | "
+                    f"{safe(row[5]):<8} | "
+                    f"{safe(row[6]):<3} | "
+                    f"{safe(row[7])}"
                 )
 
-        # 3. Tambah pasien masuk
+        # 3. Tambah pasien
         def tambah_pasien(cursor):
             Nama = input("Nama pasien        : ")
             NIK = input("NIK                : ")
             Tgl_Lahir = input("Tanggal lahir (YYYY-MM-DD): ")
             ID_Kelas = int(input("ID Kelas           : "))
-            Penjamin = input("Penjamin : ")
+            Penjamin = input("Penjamin           : ")
             Tgl_Masuk = input("Tanggal masuk (YYYY-MM-DD): ")
 
-            query = (
-                "INSERT INTO inap (Nama, NIK, Tgl_Lahir, ID_Kelas, Penjamin, Tgl_Masuk) "
-                "VALUES (%s, %s, %s, %s, %s, %s);"
-            )
+            query = """
+                INSERT INTO inap (Nama, NIK, Tgl_Lahir, ID_Kelas, Penjamin, Tgl_Masuk)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """
             cursor.execute(query, (Nama, NIK, Tgl_Lahir, ID_Kelas, Penjamin, Tgl_Masuk))
             conn.commit()
             print("✅ Data pasien berhasil ditambahkan!")
@@ -93,130 +89,159 @@ try:
             conn.commit()
 
             if cursor.rowcount > 0:
-                query_lama = """
+                cursor.execute("""
                     UPDATE inap
                     SET Lama_Inap = DATEDIFF(Tgl_Keluar, Tgl_Masuk)
                     WHERE Nama LIKE %s AND Tgl_Lahir = %s
-                """
-                cursor.execute(query_lama, (f"%{Nama}%", Tgl_Lahir))
+                """, (f"%{Nama}%", Tgl_Lahir))
                 conn.commit()
 
                 print("✅ Tanggal keluar diperbarui!")
                 print("📌 Lama inap dihitung otomatis!")
             else:
-                print("❌ Tidak ada data yang cocok. Periksa Nama & Tanggal Lahir.")
+                print("❌ Tidak ada data yang cocok.")
 
-        # 5. Total biaya rawat inap
+        # 5. Total harga rawat inap
         def total_harga(cursor):
             print("\n=== Cetak Total Rawat Inap ===")
-            Nama = input("Masukkan Nama Pasien (tepat sama)     : ")
-            Tgl_Lahir = input("Masukkan Tanggal Lahir (YYYY-MM-DD): ")
+            Nama = input("Masukkan Nama Pasien     : ")
+            Tgl_Lahir = input("Masukkan Tanggal Lahir   : ")
 
             cursor.execute("""
                 SELECT 
-                    i.Nama,
-                    i.ID_Kelas,
+                    i.Nama, i.ID_Kelas,
                     DATEDIFF(i.Tgl_Keluar, i.Tgl_Masuk) AS Lama_Inap,
                     h.Harga_per_hari
                 FROM inap i
                 JOIN harga h ON i.ID_Kelas = h.ID_Kelas
-                WHERE i.Nama = %s AND i.Tgl_Lahir = %s;
+                WHERE i.Nama = %s AND i.Tgl_Lahir = %s
             """, (Nama, Tgl_Lahir))
 
             row = cursor.fetchone()
-
-            if row is None:
-                print("\n❌ Data pasien tidak ditemukan.")
+            if not row:
+                print("❌ Data tidak ditemukan.")
                 return
 
-            nama, kelas, lama_inap, harga_per_hari = row
+            nama, kelas, lama, harga = row
 
-            if lama_inap is None:
-                print("❌ Lama inap tidak dapat dihitung. Pastikan Tgl_Masuk dan Tgl_Keluar terisi.")
-                return
-
-            if harga_per_hari is None:
-                print("❌ Harga per hari tidak ditemukan untuk ID_Kelas tersebut.")
-                return
-
-            total_biaya = lama_inap * harga_per_hari
-
+            total = lama * harga
             print("\n=== Total Biaya Rawat Inap ===")
             print(f"Nama Pasien      : {nama}")
             print(f"Kelas Kamar      : {kelas}")
-            print(f"Lama Inap        : {lama_inap} hari")
-            print(f"Harga per Hari   : Rp {harga_per_hari:,}")
-            print(f"Total Biaya      : Rp {total_biaya:,}")
+            print(f"Lama Inap        : {lama} hari")
+            print(f"Harga per Hari   : Rp {harga:,}")
+            print(f"Total Biaya      : Rp {total:,}")
             print("=============================\n")
 
-        # 6. Statistik diagram batang
+        # 6. Diagram batang rata-rata lama inap
         def diagram_batang(cursor):
             cursor.execute("""
                 SELECT ID_Kelas, AVG(Lama_Inap)
                 FROM inap
                 WHERE Lama_Inap IS NOT NULL
                 GROUP BY ID_Kelas
-                ORDER BY ID_Kelas ASC;
+                ORDER BY ID_Kelas
             """)
-
             data = cursor.fetchall()
-            kelas = [str(row[0]) for row in data]
-            rata2_lama = [row[1] for row in data]
+
+            kelas = [str(d[0]) for d in data]
+            rata2 = [int(d[1]) for d in data]
 
             plt.figure(figsize=(8, 5))
-            plt.bar(kelas, rata2_lama)
-            plt.title("Rata-rata Lama Inap per Kelas Kamar")
+            plt.bar(kelas, rata2)
+            plt.title("Rata-rata Lama Inap per Kelas")
             plt.xlabel("ID Kelas")
-            plt.ylabel("Rata-rata Lama Inap (hari)")
-            plt.grid(axis='y', linestyle='--', linewidth=0.5)
+            plt.ylabel("Rata-rata Hari")
+            plt.grid(axis='y', linestyle='--')
             plt.show()
 
-        # 7. Menu utama
+        # 7. Statistik Dasar (deskriptif)
+        def statistik_dasar(cursor):
+            print("\n=== Statistik Dasar Rawat Inap ===")
+
+            cursor.execute("""
+                SELECT COUNT(*), AVG(Lama_Inap), MIN(Lama_Inap), MAX(Lama_Inap)
+                FROM inap
+                WHERE Lama_Inap IS NOT NULL
+            """)
+
+            total, rata2, minimum, maksimum = cursor.fetchone()
+            rata2 = int(rata2) if rata2 else 0
+
+            print(f"Total pasien               : {total}")
+            print(f"Rata-rata lama inap        : {rata2} hari")
+            print(f"Lama inap minimum          : {minimum} hari")
+            print(f"Lama inap maksimum         : {maksimum} hari")
+
+            print("\n--- Statistik Per Kelas ---")
+            cursor.execute("""
+                SELECT ID_Kelas, COUNT(*), AVG(Lama_Inap), MIN(Lama_Inap), MAX(Lama_Inap)
+                FROM inap
+                WHERE Lama_Inap IS NOT NULL
+                GROUP BY ID_Kelas
+                ORDER BY ID_Kelas
+            """)
+
+            rows = cursor.fetchall()
+            for r in rows:
+                kelas, tot, avg, mn, mx = r
+                print(f"\nKelas {kelas}:")
+                print(f"   Jumlah pasien          : {tot}")
+                print(f"   Rata-rata lama inap    : {int(avg) if avg else 0} hari")
+                print(f"   Minimal lama inap      : {mn}")
+                print(f"   Maksimal lama inap     : {mx}")
+
+        # ======================================================
+        #                      MENU
+        # ======================================================
+
         def menu():
             print("=====================================")
             print("   Selamat Datang di RS SUCI 💙")
             print("=====================================")
-
             print("""
-        Menu Utama:
-        1. Daftar Harga Kamar
-        2. Daftar Pasien Rawat Inap
-        3. Tambah Data Pasien Rawat Inap Baru
-        4. Update Tanggal Keluar Pasien
-        5. Total Biaya
-        6. Statistik 
-        7. Keluar
+    1. Daftar Harga Kamar
+    2. Daftar Pasien Rawat Inap
+    3. Tambah Data Pasien Baru
+    4. Update Tanggal Keluar Pasien
+    5. Total Biaya Rawat Inap
+    6. Diagram Statistik
+    7. Statistik Deskriptif
+    8. Keluar
             """)
+            return input("Masukkan pilihan (1-8): ")
 
-            return input("Masukkan pilihan (1-7): ")
+        # ======================================================
+        #                      MAIN LOOP
+        # ======================================================
 
-        # 8. Main loop
         def main():
-            run = True
-            while run:
-                pilihan = menu()
-                if pilihan == "1":
+            while True:
+                pil = menu()
+
+                if pil == "1":
                     harga_kamar(cursor)
-                elif pilihan == "2":
+                elif pil == "2":
                     daftar_rawat_inap(cursor)
-                elif pilihan == "3":
+                elif pil == "3":
                     tambah_pasien(cursor)
-                elif pilihan == "4":
+                elif pil == "4":
                     update_tanggal_keluar(cursor, conn)
-                elif pilihan == "5":
+                elif pil == "5":
                     total_harga(cursor)
-                elif pilihan == "6":
+                elif pil == "6":
                     diagram_batang(cursor)
-                elif pilihan == "7":
-                    print("Terima kasih telah mengunjungi RS SUCI 🙏")
-                    run = False
+                elif pil == "7":
+                    statistik_dasar(cursor)
+                elif pil == "8":
+                    print("Terima kasih telah menggunakan sistem RS SUCI 🙏")
+                    break
                 else:
-                    print("Pilihan tidak valid, coba lagi.")
+                    print("Pilihan tidak valid!")
 
-
-        # ===============================
-        # 🔥 PANGGIL MAIN DI DALAM TRY 🔥
-        # ===============================
+        # ============================
+        #          JALANKAN
+        # ============================
         main()
 
 except mysql.connector.Error as err:
@@ -224,12 +249,9 @@ except mysql.connector.Error as err:
 
 finally:
     try:
-        if 'cursor' in locals() and cursor is not None:
-            cursor.close()
-
-        if 'conn' in locals() and conn is not None and conn.is_connected():
+        if 'cursor' in locals(): cursor.close()
+        if 'conn' in locals() and conn.is_connected():
             conn.close()
             print("Connection closed!")
-
     except Exception as e:
         print(f"Gagal menutup koneksi: {e}")
