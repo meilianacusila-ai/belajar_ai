@@ -1,0 +1,270 @@
+
+import os
+from uuid import uuid4
+from typing import Dict, Any, List, Optional
+
+import pandas as pd
+from dotenv import load_dotenv
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance, PointStruct, PayloadSchemaType
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+
+
+# =========================
+# ENV
+# =========================
+load_dotenv()
+
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not QDRANT_URL or not QDRANT_API_KEY or not OPENAI_API_KEY:
+    raise RuntimeError("ENV belum lengkap. Pastikan QDRANT_URL, QDRANT_API_KEY, OPENAI_API_KEY ada di .env")
+
+COLLECTIONS = {
+    "polis": r"D:\data ai\Purwadhika\Capstone\Capstone3_kk\data\Buku_Polis_Asuransi_Kesehatan.pdf",
+    "nasabah": r"D:\data ai\Purwadhika\Capstone\Capstone3_kk\data\data_nasabah_asuransi.csv",
+    "rs_rekanan": r"D:\data ai\Purwadhika\Capstone\Capstone3_kk\data\data_rs_rekanan.csv",
+}
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+EMBED_BATCH = 64
+UPSERT_BATCH = 128
+
+
+# =========================
+# CLIENTS
+# =========================
+client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+embedder = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+
+splitter_polis = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+
+
+# =========================
+# HELPERS
+# =========================
+def ensure_collection(collection_name: str, vector_size: int):
+    if not client.collection_exists(collection_name):
+        client.create_collection(
+            collection_name=collection_name,
+            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+        )
+        print(f"🆕 collection '{collection_name}' dibuat")
+
+
+def safe_str(x: Any) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+    if s.lower() in ("nan", "none"):
+        return ""
+    return s
+
+
+def mk_text_from_row(row: Dict[str, Any], keys_priority: Optional[List[str]] = None) -> str:
+    """
+    Buat text untuk embedding dari row CSV.
+    Ini penting untuk semantic fallback, tapi payload kolom tetap utama.
+    """
+    keys = list(row.keys())
+    if keys_priority:
+        keys = keys_priority + [k for k in keys if k not in keys_priority]
+
+    parts = []
+    for k in keys:
+        v = safe_str(row.get(k))
+        if v:
+            parts.append(f"{k}: {v}")
+    return "\n".join(parts)
+
+
+def upsert_points_batched(collection_name: str, points: List[PointStruct]):
+    for i in range(0, len(points), UPSERT_BATCH):
+        client.upsert(collection_name=collection_name, points=points[i:i+UPSERT_BATCH])
+
+
+def create_keyword_index(collection: str, key: str):
+    try:
+        client.create_payload_index(collection, key, PayloadSchemaType.KEYWORD)
+    except Exception:
+        pass
+
+
+# =========================
+# UPLOAD POLIS (PDF -> chunk -> embed)
+# =========================
+def upload_polis():
+    pdf_path = COLLECTIONS["polis"]
+    docs = PyPDFLoader(pdf_path).load()
+    chunks = splitter_polis.split_documents(docs)
+
+    texts = [c.page_content for c in chunks]
+    metas = [c.metadata for c in chunks]
+
+    dim_vec = embedder.embed_query("dim_check")
+    ensure_collection("polis", vector_size=len(dim_vec))
+
+    points: List[PointStruct] = []
+    for start in range(0, len(texts), EMBED_BATCH):
+        batch_texts = texts[start:start+EMBED_BATCH]
+        batch_metas = metas[start:start+EMBED_BATCH]
+        vectors = embedder.embed_documents(batch_texts)
+
+        for i in range(len(vectors)):
+            payload = {
+                **(batch_metas[i] or {}),
+                "source_type": "pdf",
+                "source_file": "Buku_Polis_Asuransi_Kesehatan.pdf",
+                "text": batch_texts[i],
+            }
+            points.append(PointStruct(id=str(uuid4()), vector=vectors[i], payload=payload))
+
+    upsert_points_batched("polis", points)
+    print(f"✅ polis upload sukses | total vector: {client.count('polis').count}")
+
+
+# =========================
+# UPLOAD NASABAH (CSV row -> payload fields + embed text)
+# =========================
+def upload_nasabah():
+    csv_path = COLLECTIONS["nasabah"]
+    df = pd.read_csv(csv_path)
+
+    # normalisasi nama kolom: strip spasi
+    df.columns = [c.strip() for c in df.columns]
+
+    # cari kolom no_polis yg paling mungkin
+    polis_candidates = ["no_polis", "nomor_polis", "no polis", "nomor polis", "policy_no", "policy_number"]
+    no_polis_col = None
+    for c in df.columns:
+        if c.lower() in [x.lower() for x in polis_candidates]:
+            no_polis_col = c
+            break
+
+    if not no_polis_col:
+        print("⚠️ WARNING: kolom no_polis tidak terdeteksi. Pastikan CSV punya kolom nomor polis.")
+        # tetap lanjut, tapi chatbot filter exact bisa susah
+
+    dim_vec = embedder.embed_query("dim_check")
+    ensure_collection("nasabah", vector_size=len(dim_vec))
+
+    points: List[PointStruct] = []
+
+    rows = df.to_dict(orient="records")
+    for start in range(0, len(rows), EMBED_BATCH):
+        batch = rows[start:start+EMBED_BATCH]
+
+        # buat text embedding
+        texts = []
+        payloads = []
+        for r in batch:
+            row = {k: (None if pd.isna(v) else v) for k, v in r.items()}
+            # payload = kolom asli + tambahan
+            payload = {k: safe_str(v) for k, v in row.items()}
+            payload["source_type"] = "csv"
+            payload["source_file"] = "data_nasabah_asuransi.csv"
+
+            # text untuk semantic
+            text = mk_text_from_row(payload, keys_priority=[no_polis_col] if no_polis_col else None)
+            payload["text"] = text
+
+            # alias untuk memudahkan filter chatbot
+            if no_polis_col and payload.get(no_polis_col):
+                payload["no_polis"] = payload.get(no_polis_col)
+
+            texts.append(text)
+            payloads.append(payload)
+
+        vectors = embedder.embed_documents(texts)
+        for i in range(len(vectors)):
+            points.append(PointStruct(id=str(uuid4()), vector=vectors[i], payload=payloads[i]))
+
+    upsert_points_batched("nasabah", points)
+    print(f"✅ nasabah upload sukses | total vector: {client.count('nasabah').count}")
+
+    # index penting
+    create_keyword_index("nasabah", "no_polis")
+    for k in ["plan", "status_polis", "metode_klaim", "tanggal_mulai", "tanggal_akhir", "expired_date", "end_date"]:
+        create_keyword_index("nasabah", k)
+
+
+# =========================
+# UPLOAD RS REKANAN (CSV row -> payload fields + embed text)
+# =========================
+def upload_rs():
+    csv_path = COLLECTIONS["rs_rekanan"]
+    df = pd.read_csv(csv_path)
+    df.columns = [c.strip() for c in df.columns]
+
+    # cari kolom umum
+    # kita buat alias minimal: nama_rs, kota, cashless
+    col_map = {}
+    for c in df.columns:
+        cl = c.lower()
+        if cl in ("nama_rs", "nama rs", "rumah_sakit", "rumah sakit", "rs"):
+            col_map["nama_rs"] = c
+        if cl in ("kota", "city"):
+            col_map["kota"] = c
+        if cl in ("cashless", "metode", "metode_klaim", "pembayaran"):
+            col_map["cashless"] = c
+
+    dim_vec = embedder.embed_query("dim_check")
+    ensure_collection("rs_rekanan", vector_size=len(dim_vec))
+
+    points: List[PointStruct] = []
+
+    rows = df.to_dict(orient="records")
+    for start in range(0, len(rows), EMBED_BATCH):
+        batch = rows[start:start+EMBED_BATCH]
+
+        texts = []
+        payloads = []
+        for r in batch:
+            row = {k: (None if pd.isna(v) else v) for k, v in r.items()}
+            payload = {k: safe_str(v) for k, v in row.items()}
+            payload["source_type"] = "csv"
+            payload["source_file"] = "data_rs_rekanan.csv"
+
+            # buat alias field standar untuk chatbot
+            if "nama_rs" in col_map and payload.get(col_map["nama_rs"]):
+                payload["nama_rs"] = payload.get(col_map["nama_rs"])
+            if "kota" in col_map and payload.get(col_map["kota"]):
+                payload["kota"] = payload.get(col_map["kota"])
+            if "cashless" in col_map and payload.get(col_map["cashless"]):
+                payload["cashless"] = payload.get(col_map["cashless"])
+
+            # text embedding
+            text = mk_text_from_row(payload, keys_priority=["kota", "nama_rs", "cashless"])
+            payload["text"] = text
+
+            texts.append(text)
+            payloads.append(payload)
+
+        vectors = embedder.embed_documents(texts)
+        for i in range(len(vectors)):
+            points.append(PointStruct(id=str(uuid4()), vector=vectors[i], payload=payloads[i]))
+
+    upsert_points_batched("rs_rekanan", points)
+    print(f"✅ rs_rekanan upload sukses | total vector: {client.count('rs_rekanan').count}")
+
+    # index penting buat filter
+    create_keyword_index("rs_rekanan", "kota")
+    create_keyword_index("rs_rekanan", "nama_rs")
+    create_keyword_index("rs_rekanan", "cashless")
+
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    upload_polis()
+    upload_nasabah()
+    upload_rs()
+    print("✅ SEMUA DATA MASUK QDRANT (payload kolom + text untuk RAG)")
